@@ -1,4 +1,3 @@
-
 import json
 
 from langchain_openai import ChatOpenAI
@@ -86,9 +85,11 @@ def generate_strategy(
     recent_topics = [
         item["topic"] for item in recent_content
     ]
+
     recent_formats = [
         item["format"] for item in recent_content
     ]
+
     recent_hooks = [
         item["hook_style"] for item in recent_content
     ]
@@ -120,78 +121,139 @@ def generate_strategy(
         ensure_ascii=False,
     )
 
-    # Request a JSON response without relying on native
-    # structured-output support from the selected model.
-    result = model.invoke(
-        [
-            ("system", SYSTEM_PROMPT),
-            (
-                "human",
-                (
-                    "Create a content strategy using this "
-                    "account context:\n"
-                    f"{json.dumps(context, ensure_ascii=False, indent=2)}"
-                    "\n\nReturn ONLY one valid JSON object. "
-                    "Do not include Markdown fences, comments, "
-                    "or explanations outside the JSON.\n\n"
-                    "The JSON must follow this schema:\n"
-                    f"{schema}"
-                ),
-            ),
-        ]
-    )
+    # Maximum number of strategy-generation attempts.
+    # 1 initial attempt + 2 retries.
+    max_attempts = 3
 
-    # Extract the text returned by the model.
-    content = result.content
+    # Stores the duplicate topic when a retry is required.
+    duplicate_topic = None
 
-    if isinstance(content, str):
-        raw_text = content
-    elif isinstance(content, list):
-        text_parts = []
+    for attempt in range(max_attempts):
 
-        for part in content:
-            if isinstance(part, str):
-                text_parts.append(part)
-            elif isinstance(part, dict):
-                text_value = part.get("text")
-                if isinstance(text_value, str):
-                    text_parts.append(text_value)
-
-        raw_text = "\n".join(text_parts)
-    else:
-        raise ValueError(
-            "The model returned an unsupported response format."
+        # Build the normal generation request.
+        human_prompt = (
+            "Create a content strategy using this "
+            "account context:\n"
+            f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+            "\n\n"
+            "Return ONLY one valid JSON object. "
+            "Do not include Markdown fences, comments, "
+            "or explanations outside the JSON.\n\n"
+            "The JSON must follow this schema:\n"
+            f"{schema}"
         )
 
-    raw_text = raw_text.strip()
+        # If a previous attempt generated a duplicate topic,
+        # explicitly ask for a completely different topic.
+        if duplicate_topic is not None:
+            human_prompt = (
+                "Your previous response repeated a recently "
+                "covered topic.\n\n"
+                f"Rejected topic: {duplicate_topic}\n\n"
+                "Generate a completely different topic this time. "
+                "Do not use the same topic with different wording. "
+                "Choose a genuinely distinct subject while following "
+                "the original account context.\n\n"
+                "Account context:\n"
+                f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+                "\n\n"
+                "Return ONLY one valid JSON object. "
+                "Do not include Markdown fences, comments, "
+                "or explanations outside the JSON.\n\n"
+                "The JSON must follow this schema:\n"
+                f"{schema}"
+            )
 
-    # Remove a Markdown code fence if the model adds one anyway.
-    if raw_text.startswith("```"):
-        lines = raw_text.splitlines()
+        # Ask the model to generate the strategy.
+        result = model.invoke(
+            [
+                ("system", SYSTEM_PROMPT),
+                ("human", human_prompt),
+            ]
+        )
 
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
+        # Extract the text returned by the model.
+        content = result.content
 
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
+        if isinstance(content, str):
+            raw_text = content
 
-        raw_text = "\n".join(lines).strip()
+        elif isinstance(content, list):
+            text_parts = []
 
-        if raw_text.lower().startswith("json"):
-            raw_text = raw_text[4:].strip()
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
 
-    # Parse JSON and validate all fields using Pydantic.
-    try:
-        parsed_data = json.loads(raw_text)
-        strategy = StrategyOutput.model_validate(parsed_data)
+                elif isinstance(part, dict):
+                    text_value = part.get("text")
 
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
-        raise ValueError(
-            "The model did not return valid StrategyOutput JSON. "
-            "Try again or select another OpenRouter model. "
-            f"Parsing details: {exc}"
-        ) from exc
+                    if isinstance(text_value, str):
+                        text_parts.append(text_value)
 
-    validate_topic_is_new(strategy, recent_topics)
+            raw_text = "\n".join(text_parts)
 
-    return strategy
+        else:
+            raise ValueError(
+                "The model returned an unsupported response format."
+            )
+
+        raw_text = raw_text.strip()
+
+        # Remove a Markdown code fence if the model adds one anyway.
+        if raw_text.startswith("```"):
+            lines = raw_text.splitlines()
+
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+
+            raw_text = "\n".join(lines).strip()
+
+            if raw_text.lower().startswith("json"):
+                raw_text = raw_text[4:].strip()
+
+        # Parse JSON and validate all fields using Pydantic.
+        try:
+            parsed_data = json.loads(raw_text)
+            strategy = StrategyOutput.model_validate(parsed_data)
+
+        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+            raise ValueError(
+                "The model did not return valid StrategyOutput JSON. "
+                "Try again or select another OpenRouter model. "
+                f"Parsing details: {exc}"
+            ) from exc
+
+        # Check whether the generated topic is a duplicate.
+        try:
+            validate_topic_is_new(
+                strategy,
+                recent_topics,
+            )
+
+        except ValueError as exc:
+            duplicate_topic = strategy.topic
+
+            # If this was the final allowed attempt,
+            # stop instead of making another API call.
+            if attempt == max_attempts - 1:
+                raise ValueError(
+                    f"Failed to generate a new topic after "
+                    f"{max_attempts} attempts. "
+                    f"Last duplicate topic: {strategy.topic}"
+                ) from exc
+
+            # Otherwise retry with duplicate-topic feedback.
+            continue
+
+        # Topic is new, so return the valid strategy.
+        return strategy
+
+    # Defensive fallback. The loop should always either
+    # return a strategy or raise an exception.
+    raise RuntimeError(
+        "Strategy generation ended unexpectedly."
+    )
