@@ -1,0 +1,30 @@
+
+{
+  "data_type": "synthetic_demo",
+  "events": [
+    {
+      "event_id": "event_001",
+      "name": "Illustrative national policy anniversary",
+      "event_date": "2026-10-15",
+      "category": "Politics",
+      "relevance": 0.85,
+      "source_url": null,
+      "source_name": null,
+      "verified_at": null,
+      "verification_status": "unverified_demo",
+      "suggested_content_bucket": "Indian History"
+    },
+    {
+      "event_id": "event_002",
+      "name": "Illustrative economic policy explainer opportunity",
+      "event_date": "2026-10-20",
+      "category": "Economy",
+      "relevance": 0.75,
+      "source_url": null,
+      "source_name": null,
+      "verified_at": null,
+      "verification_status": "unverified_demo",
+      "suggested_content_bucket": "Economy"
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+
+{
+  "data_type": "synthetic_demo",
+  "competitors": [
+    {
+      "competitor_id": "comp_001",
+      "name": "Sample Explainer Channel A",
+      "platform": "Instagram",
+      "posts": [
+        {
+          "post_id": "comp_post_001",
+          "topic": "Global trade",
+          "hook_style": "Question",
+          "format": "Map Animation",
+          "duration_seconds": 45,
+          "views": 180000,
+          "shares": 4100,
+          "observed_at": "2026-09-25"
+        },
+        {
+          "post_id": "comp_post_002",
+          "topic": "Inflation",
+          "hook_style": "Surprising Fact",
+          "format": "Documentary Reel",
+          "duration_seconds": 50,
+          "views": 95000,
+          "shares": 1300,
+          "observed_at": "2026-09-27"
+        }
+      ]
+    },
+    {
+      "competitor_id": "comp_002",
+      "name": "Sample Geopolitics Channel B",
+      "platform": "Instagram",
+      "posts": [
+        {
+          "post_id": "comp_post_003",
+          "topic": "Energy security",
+          "hook_style": "Conflict",
+          "format": "Documentary Reel",
+          "duration_seconds": 55,
+          "views": 210000,
+          "shares": 5200,
+          "observed_at": "2026-09-28"
+        }
+      ]
+    }
+  ]
+}

@@ -24,3 +24,8 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+
+# Generated local database
+data/*.db
+data/*.db-journal

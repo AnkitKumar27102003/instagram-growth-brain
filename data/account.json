@@ -1,0 +1,46 @@
+
+{
+  "account_id": "nazar.for.world",
+  "name": "NAZAR",
+  "platform": "Instagram",
+  "niche": [
+    "Politics",
+    "Economy",
+    "History",
+    "Geopolitics",
+    "Current Affairs"
+  ],
+  "language": "Hinglish",
+  "target_audience": {
+    "region": "India",
+    "age_range": "18-34",
+    "interests": [
+      "Indian politics",
+      "International relations",
+      "Economics",
+      "History"
+    ]
+  },
+  "content_buckets": [
+    "Explainers",
+    "Geopolitics",
+    "Economy",
+    "Indian History",
+    "Current Affairs"
+  ],
+  "brand_voice": [
+    "Informative",
+    "Investigative",
+    "Neutral",
+    "Documentary-style"
+  ],
+  "goals": [
+    "Increase non-follower reach",
+    "Improve watch time",
+    "Increase shares and saves",
+    "Build audience trust"
+  ],
+  "default_script_language": "Hinglish",
+  "segment_word_min": 18,
+  "segment_word_max": 23
+}
