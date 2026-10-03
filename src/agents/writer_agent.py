@@ -111,3 +111,72 @@ Make sure every voiceover contains 18–23 words.
         f"Writer Agent failed validation after 2 attempts: {last_error}"
     )
 
+def revise_script(
+    strategy: StrategyOutput,
+    previous_script: ScriptOutput,
+    revision_instructions: list[str],
+) -> ScriptOutput:
+    if not settings.openrouter_api_key:
+        raise ValueError("OPENROUTER_API_KEY is not configured.")
+
+    model = ChatOpenAI(
+        model=settings.openrouter_model,
+        api_key=settings.openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+        temperature=0.4,
+    )
+
+    schema = json.dumps(ScriptOutput.model_json_schema(), indent=2)
+
+    prompt = f"""
+{SYSTEM_PROMPT}
+
+You are revising an existing NAZAR Reel script based on
+the Critic Agent's feedback.
+
+Selected strategy:
+{strategy.model_dump_json(indent=2)}
+
+Previous script:
+{previous_script.model_dump_json(indent=2)}
+
+Revision instructions:
+{json.dumps(revision_instructions, ensure_ascii=False, indent=2)}
+
+Improve the script while preserving its topic, core meaning,
+and strategy. Do not add unsupported factual claims.
+
+Every voiceover must contain 18–23 whitespace-separated words.
+Return only valid JSON matching this schema:
+{schema}
+"""
+
+    last_error = None
+
+    for attempt in range(2):
+        try:
+            response = model.invoke(prompt)
+            data = _extract_json(response)
+            revised = ScriptOutput.model_validate(data)
+
+            if revised.topic != strategy.topic:
+                raise ValueError("Revised script topic does not match strategy.")
+
+            return revised
+
+        except (json.JSONDecodeError, ValidationError, ValueError) as error:
+            last_error = error
+
+            if attempt == 0:
+                prompt += f"""
+
+Your previous response failed validation:
+{str(error)}
+
+Return corrected JSON. Keep the topic unchanged and ensure
+every voiceover contains 18–23 words.
+"""
+
+    raise ValueError(
+        f"Writer revision failed validation after 2 attempts: {last_error}"
+    )
