@@ -41,6 +41,26 @@ Rules:
 """
 
 
+def _normalize_topic(topic: str) -> str:
+    """Normalize a topic for basic duplicate detection."""
+    return " ".join(topic.casefold().split()).strip(" .!?,")
+
+
+def validate_topic_is_new(
+    strategy: StrategyOutput,
+    recent_topics: list[str],
+) -> None:
+    """Reject a strategy that repeats a recently covered topic."""
+    proposed_topic = _normalize_topic(strategy.topic)
+
+    for recent_topic in recent_topics:
+        if proposed_topic == _normalize_topic(recent_topic):
+            raise ValueError(
+                "The generated strategy repeats a recently "
+                f"covered topic: {strategy.topic}"
+            )
+
+
 def generate_strategy(
     account_id: str,
     content_goal: str = "Recommend the next useful post for NAZAR.",
@@ -171,5 +191,7 @@ def generate_strategy(
             "Try again or select another OpenRouter model. "
             f"Parsing details: {exc}"
         ) from exc
+
+    validate_topic_is_new(strategy, recent_topics)
 
     return strategy
