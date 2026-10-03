@@ -53,12 +53,14 @@ def setup_mocks(monkeypatch, critique_scores):
     script = make_script()
     critique_calls = {"count": 0}
     revision_calls = {"count": 0}
+    saved_scripts = []
 
     monkeypatch.setattr(
         workflow,
         "generate_strategy",
         lambda account_id: strategy,
     )
+
     monkeypatch.setattr(
         workflow,
         "generate_script",
@@ -74,14 +76,19 @@ def setup_mocks(monkeypatch, critique_scores):
         revision_calls["count"] += 1
         return previous_script
 
+    def fake_save(**kwargs):
+        saved_scripts.append(kwargs)
+        return "test-script-id"
+
     monkeypatch.setattr(workflow, "critique_script", fake_critique)
     monkeypatch.setattr(workflow, "revise_script", fake_revision)
+    monkeypatch.setattr(workflow, "save_approved_script", fake_save)
 
-    return critique_calls, revision_calls
+    return critique_calls, revision_calls, saved_scripts
 
 
 def test_workflow_stops_when_score_passes(monkeypatch):
-    critique_calls, revision_calls = setup_mocks(
+    critique_calls, revision_calls, saved_scripts = setup_mocks(
         monkeypatch,
         [9.0],
     )
@@ -94,9 +101,13 @@ def test_workflow_stops_when_score_passes(monkeypatch):
     assert critique_calls["count"] == 1
     assert revision_calls["count"] == 0
 
+    assert len(saved_scripts) == 1
+    assert saved_scripts[0]["critic_score"] == 9.0
+    assert result["saved_script_id"] == "test-script-id"
+
 
 def test_workflow_never_exceeds_three_revisions(monkeypatch):
-    critique_calls, revision_calls = setup_mocks(
+    critique_calls, revision_calls, saved_scripts = setup_mocks(
         monkeypatch,
         [6.0, 7.0, 7.5, 8.0],
     )
@@ -108,3 +119,40 @@ def test_workflow_never_exceeds_three_revisions(monkeypatch):
     assert critique_calls["count"] == 4
     assert revision_calls["count"] == 3
     assert len(result["revision_history"]) == 4
+
+    assert len(saved_scripts) == 0
+    assert result["saved_script_id"] is None
+
+
+def test_workflow_saves_script_at_exact_passing_threshold(monkeypatch):
+    _, _, saved_scripts = setup_mocks(
+        monkeypatch,
+        [8.5],
+    )
+
+    result = workflow.run_content_workflow("nazar.for.world")
+
+    assert result["passed"] is True
+    assert result["overall_score"] == 8.5
+    assert len(saved_scripts) == 1
+    assert saved_scripts[0]["topic"] == "India's digital economy"
+    assert saved_scripts[0]["account_id"] == "nazar.for.world"
+    assert result["saved_script_id"] == "test-script-id"
+
+
+def test_workflow_does_not_save_script_below_threshold(monkeypatch):
+    critique_calls, revision_calls, saved_scripts = setup_mocks(
+        monkeypatch,
+        [8.4, 8.4, 8.4, 8.4],
+    )
+
+    result = workflow.run_content_workflow("nazar.for.world")
+
+    assert result["passed"] is False
+    assert result["overall_score"] == 8.4
+    assert result["revision_rounds"] == 3
+    assert critique_calls["count"] == 4
+    assert revision_calls["count"] == 3
+
+    assert len(saved_scripts) == 0
+    assert result["saved_script_id"] is None

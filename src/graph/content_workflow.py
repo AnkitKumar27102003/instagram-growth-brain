@@ -8,6 +8,7 @@ from src.agents.writer_agent import (
     generate_script,
     revise_script,
 )
+from src.memory.performance_memory import save_approved_script
 from src.models.critique import CritiqueOutput
 from src.models.script import ScriptOutput
 from src.models.strategy import StrategyOutput
@@ -55,12 +56,31 @@ def run_content_workflow(account_id: str) -> dict:
         )
         revision_rounds += 1
 
+    passed = overall_score >= PASSING_SCORE
+    saved_script_id = None
+
+    if passed:
+        saved_script_id = save_approved_script(
+            account_id=account_id,
+            topic=script.topic,
+            content_bucket=script.content_bucket,
+            hook_style=script.hook_style,
+            format=strategy.format,
+            tone=strategy.tone,
+            strategy=strategy.model_dump(),
+            script_text="\n".join(
+                segment.voiceover for segment in script.segments
+            ),
+            critic_score=overall_score,
+        )
+
     return {
         "strategy": strategy,
         "script": script,
         "critique": critique,
         "overall_score": overall_score,
         "revision_rounds": revision_rounds,
-        "passed": overall_score >= PASSING_SCORE,
+        "passed": passed,
+        "saved_script_id": saved_script_id,
         "revision_history": revision_history,
     }
