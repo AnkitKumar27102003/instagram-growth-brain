@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import agents
 from src.agents import strategy_agent
 from src.models.strategy import StrategyOutput
 
 
 def make_strategy(topic: str) -> StrategyOutput:
+    """Create a lightweight strategy for validation tests."""
     return StrategyOutput.model_construct(topic=topic)
 
 
@@ -31,8 +31,12 @@ def make_strategy_response(topic: str) -> dict:
     }
 
 
-def setup_mocked_strategy_agent(monkeypatch, responses, recent_topics):
-    """Mock memory and OpenRouter calls for strategy generation."""
+def setup_mocked_strategy_agent(
+    monkeypatch,
+    responses,
+    recent_topics,
+):
+    """Mock memory, semantic similarity, and OpenRouter calls."""
     monkeypatch.setattr(
         strategy_agent.settings,
         "openrouter_api_key",
@@ -61,6 +65,14 @@ def setup_mocked_strategy_agent(monkeypatch, responses, recent_topics):
             "patterns": [],
             "note": "Test performance data",
         },
+    )
+
+    # Keep tests independent of the real embedding model.
+    # Exact duplicates are still caught by normalization.
+    monkeypatch.setattr(
+        strategy_agent,
+        "are_topics_semantically_similar",
+        lambda topic_a, topic_b: False,
     )
 
     class FakeModel:
@@ -94,8 +106,12 @@ def setup_mocked_strategy_agent(monkeypatch, responses, recent_topics):
 
 
 def test_rejects_exact_duplicate_topic():
-    strategy = make_strategy("Why is the rupee weakening?")
-    recent_topics = ["Why is the rupee weakening?"]
+    strategy = make_strategy(
+        "Why is the rupee weakening?"
+    )
+    recent_topics = [
+        "Why is the rupee weakening?"
+    ]
 
     with pytest.raises(
         ValueError,
@@ -111,7 +127,9 @@ def test_rejects_duplicate_with_different_case_and_spacing():
     strategy = make_strategy(
         "  WHY IS THE RUPEE WEAKENING? "
     )
-    recent_topics = ["why is the rupee weakening?"]
+    recent_topics = [
+        "why is the rupee weakening?"
+    ]
 
     with pytest.raises(
         ValueError,
@@ -123,11 +141,43 @@ def test_rejects_duplicate_with_different_case_and_spacing():
         )
 
 
-def test_allows_a_new_topic():
+def test_rejects_semantically_similar_topic(monkeypatch):
+    strategy = make_strategy(
+        "What is causing the Indian currency to weaken?"
+    )
+    recent_topics = [
+        "Why is the rupee falling?"
+    ]
+
+    monkeypatch.setattr(
+        strategy_agent,
+        "are_topics_semantically_similar",
+        lambda topic_a, topic_b: True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="semantically similar",
+    ):
+        strategy_agent.validate_topic_is_new(
+            strategy,
+            recent_topics,
+        )
+
+
+def test_allows_a_new_topic(monkeypatch):
     strategy = make_strategy(
         "How does inflation affect households?"
     )
-    recent_topics = ["Why is the rupee weakening?"]
+    recent_topics = [
+        "Why is the rupee weakening?"
+    ]
+
+    monkeypatch.setattr(
+        strategy_agent,
+        "are_topics_semantically_similar",
+        lambda topic_a, topic_b: False,
+    )
 
     strategy_agent.validate_topic_is_new(
         strategy,
@@ -186,7 +236,7 @@ def test_retries_after_duplicate_and_returns_new_topic(monkeypatch):
     retry_prompt = fake_model.calls[1][1][1]
 
     assert "Why is the rupee weakening?" in retry_prompt
-    assert "completely different topic" in retry_prompt
+    assert "genuinely different topic" in retry_prompt
 
 
 def test_retries_twice_before_returning_new_topic(monkeypatch):
@@ -246,3 +296,15 @@ def test_raises_error_after_three_duplicate_topics(monkeypatch):
         )
 
     assert len(fake_model.calls) == 3
+
+
+def test_semantic_threshold_must_be_valid():
+    with pytest.raises(
+        ValueError,
+        match="threshold must be between 0 and 1",
+    ):
+        strategy_agent.are_topics_semantically_similar(
+            "Topic A",
+            "Topic B",
+            threshold=1.5,
+        )

@@ -1,5 +1,8 @@
-import json
 
+import json
+from functools import lru_cache
+
+from sentence_transformers import SentenceTransformer
 from langchain_openai import ChatOpenAI
 
 from src.config import settings
@@ -40,24 +43,145 @@ Rules:
 """
 
 
+# Similarity threshold for flagging potentially
+# duplicate topics. Tune with real topic examples.
+SEMANTIC_SIMILARITY_THRESHOLD = 0.82
+
+# Maximum attempts: 1 initial attempt + 2 retries.
+MAX_STRATEGY_ATTEMPTS = 3
+
+
 def _normalize_topic(topic: str) -> str:
-    """Normalize a topic for basic duplicate detection."""
+    """Normalize a topic for exact duplicate detection."""
     return " ".join(topic.casefold().split()).strip(" .!?,")
+
+
+@lru_cache(maxsize=1)
+def _get_embedding_model():
+    """Load and cache the local semantic embedding model."""
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+
+def are_topics_semantically_similar(
+    topic_a: str,
+    topic_b: str,
+    threshold: float = SEMANTIC_SIMILARITY_THRESHOLD,
+) -> bool:
+    """
+    Compare two topics using locally generated embeddings.
+
+    Both embeddings are normalized, so their dot product
+    represents cosine similarity.
+    """
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("Similarity threshold must be between 0 and 1.")
+
+    normalized_a = _normalize_topic(topic_a)
+    normalized_b = _normalize_topic(topic_b)
+
+    if not normalized_a or not normalized_b:
+        return False
+
+    if normalized_a == normalized_b:
+        return True
+
+    model = _get_embedding_model()
+
+    embeddings = model.encode(
+        [topic_a, topic_b],
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+    )
+
+    similarity = float(embeddings[0] @ embeddings[1])
+
+    return similarity >= threshold
 
 
 def validate_topic_is_new(
     strategy: StrategyOutput,
     recent_topics: list[str],
 ) -> None:
-    """Reject a strategy that repeats a recently covered topic."""
-    proposed_topic = _normalize_topic(strategy.topic)
+    """Reject exact or semantically similar recent topics."""
+    proposed_topic = strategy.topic
 
     for recent_topic in recent_topics:
-        if proposed_topic == _normalize_topic(recent_topic):
+        # First, check exact duplicates after normalization.
+        if _normalize_topic(proposed_topic) == _normalize_topic(
+            recent_topic
+        ):
             raise ValueError(
                 "The generated strategy repeats a recently "
-                f"covered topic: {strategy.topic}"
+                f"covered topic: {proposed_topic}"
             )
+
+        # Then check for semantic similarity.
+        if are_topics_semantically_similar(
+            proposed_topic,
+            recent_topic,
+        ):
+            raise ValueError(
+                "The generated strategy is semantically similar "
+                "to a recently covered topic: "
+                f"{proposed_topic}"
+            )
+
+
+def _extract_response_text(content) -> str:
+    """Extract text from supported model response formats."""
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        text_parts = []
+
+        for part in content:
+            if isinstance(part, str):
+                text_parts.append(part)
+
+            elif isinstance(part, dict):
+                text_value = part.get("text")
+
+                if isinstance(text_value, str):
+                    text_parts.append(text_value)
+
+        if text_parts:
+            return "\n".join(text_parts).strip()
+
+    raise ValueError(
+        "The model returned an unsupported response format."
+    )
+
+
+def _parse_strategy_response(raw_text: str) -> StrategyOutput:
+    """Parse JSON and validate it using the Pydantic model."""
+    raw_text = raw_text.strip()
+
+    # Remove Markdown fences if the model adds them.
+    if raw_text.startswith("```"):
+        lines = raw_text.splitlines()
+
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+
+        raw_text = "\n".join(lines).strip()
+
+        if raw_text.lower().startswith("json"):
+            raw_text = raw_text[4:].strip()
+
+    try:
+        parsed_data = json.loads(raw_text)
+        return StrategyOutput.model_validate(parsed_data)
+
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise ValueError(
+            "The model did not return valid StrategyOutput JSON. "
+            "Try again or select another OpenRouter model. "
+            f"Parsing details: {exc}"
+        ) from exc
 
 
 def generate_strategy(
@@ -81,7 +205,7 @@ def generate_strategy(
     # Retrieve historical performance patterns.
     performance = get_performance_patterns(account_id)
 
-    # Build explicit avoidance lists from recent content.
+    # Build avoidance lists from recent content.
     recent_topics = [
         item["topic"] for item in recent_content
     ]
@@ -121,16 +245,10 @@ def generate_strategy(
         ensure_ascii=False,
     )
 
-    # Maximum number of strategy-generation attempts.
-    # 1 initial attempt + 2 retries.
-    max_attempts = 3
-
-    # Stores the duplicate topic when a retry is required.
     duplicate_topic = None
 
-    for attempt in range(max_attempts):
-
-        # Build the normal generation request.
+    for attempt in range(MAX_STRATEGY_ATTEMPTS):
+        # Build the prompt for this attempt.
         human_prompt = (
             "Create a content strategy using this "
             "account context:\n"
@@ -143,16 +261,16 @@ def generate_strategy(
             f"{schema}"
         )
 
-        # If a previous attempt generated a duplicate topic,
-        # explicitly ask for a completely different topic.
+        # Add feedback if a previous attempt generated a duplicate.
         if duplicate_topic is not None:
             human_prompt = (
                 "Your previous response repeated a recently "
                 "covered topic.\n\n"
                 f"Rejected topic: {duplicate_topic}\n\n"
-                "Generate a completely different topic this time. "
-                "Do not use the same topic with different wording. "
-                "Choose a genuinely distinct subject while following "
+                "Generate a genuinely different topic. "
+                "Do not use the same topic with different wording "
+                "or cover the same underlying subject again. "
+                "Choose a distinct subject while following "
                 "the original account context.\n\n"
                 "Account context:\n"
                 f"{json.dumps(context, ensure_ascii=False, indent=2)}"
@@ -172,62 +290,11 @@ def generate_strategy(
             ]
         )
 
-        # Extract the text returned by the model.
-        content = result.content
+        # Extract and validate the model response.
+        raw_text = _extract_response_text(result.content)
+        strategy = _parse_strategy_response(raw_text)
 
-        if isinstance(content, str):
-            raw_text = content
-
-        elif isinstance(content, list):
-            text_parts = []
-
-            for part in content:
-                if isinstance(part, str):
-                    text_parts.append(part)
-
-                elif isinstance(part, dict):
-                    text_value = part.get("text")
-
-                    if isinstance(text_value, str):
-                        text_parts.append(text_value)
-
-            raw_text = "\n".join(text_parts)
-
-        else:
-            raise ValueError(
-                "The model returned an unsupported response format."
-            )
-
-        raw_text = raw_text.strip()
-
-        # Remove a Markdown code fence if the model adds one anyway.
-        if raw_text.startswith("```"):
-            lines = raw_text.splitlines()
-
-            if lines and lines[0].startswith("```"):
-                lines = lines[1:]
-
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-
-            raw_text = "\n".join(lines).strip()
-
-            if raw_text.lower().startswith("json"):
-                raw_text = raw_text[4:].strip()
-
-        # Parse JSON and validate all fields using Pydantic.
-        try:
-            parsed_data = json.loads(raw_text)
-            strategy = StrategyOutput.model_validate(parsed_data)
-
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
-            raise ValueError(
-                "The model did not return valid StrategyOutput JSON. "
-                "Try again or select another OpenRouter model. "
-                f"Parsing details: {exc}"
-            ) from exc
-
-        # Check whether the generated topic is a duplicate.
+        # Reject duplicate topics and retry if attempts remain.
         try:
             validate_topic_is_new(
                 strategy,
@@ -237,23 +304,19 @@ def generate_strategy(
         except ValueError as exc:
             duplicate_topic = strategy.topic
 
-            # If this was the final allowed attempt,
-            # stop instead of making another API call.
-            if attempt == max_attempts - 1:
+            if attempt == MAX_STRATEGY_ATTEMPTS - 1:
                 raise ValueError(
-                    f"Failed to generate a new topic after "
-                    f"{max_attempts} attempts. "
+                    "Failed to generate a new topic after "
+                    f"{MAX_STRATEGY_ATTEMPTS} attempts. "
                     f"Last duplicate topic: {strategy.topic}"
                 ) from exc
 
-            # Otherwise retry with duplicate-topic feedback.
             continue
 
-        # Topic is new, so return the valid strategy.
+        # Topic is new, so return the validated strategy.
         return strategy
 
-    # Defensive fallback. The loop should always either
-    # return a strategy or raise an exception.
+    # Defensive fallback.
     raise RuntimeError(
         "Strategy generation ended unexpectedly."
     )
