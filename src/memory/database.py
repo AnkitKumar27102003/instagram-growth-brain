@@ -71,6 +71,7 @@ def initialize_database():
                 platform TEXT NOT NULL
             );
 
+
             CREATE TABLE IF NOT EXISTS competitor_posts (
                 post_id TEXT PRIMARY KEY,
                 competitor_id TEXT NOT NULL,
@@ -84,6 +85,52 @@ def initialize_database():
                 FOREIGN KEY (competitor_id)
                     REFERENCES competitors(competitor_id)
             );
+
+            
+            CREATE TABLE IF NOT EXISTS approved_scripts (
+                script_id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                content_bucket TEXT NOT NULL,
+                hook_style TEXT NOT NULL,
+                format TEXT NOT NULL,
+                tone TEXT NOT NULL,
+                strategy_json TEXT NOT NULL,
+                script_text TEXT NOT NULL,
+                critic_score REAL,
+                approved INTEGER NOT NULL DEFAULT 0
+                    CHECK (approved IN (0, 1)),
+                FOREIGN KEY (account_id)
+                    REFERENCES accounts(account_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS performance_feedback (
+                feedback_id TEXT PRIMARY KEY,
+                script_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                views INTEGER NOT NULL,
+                reach INTEGER NOT NULL,
+                likes INTEGER NOT NULL,
+                shares INTEGER NOT NULL,
+                saves INTEGER NOT NULL,
+                comments INTEGER NOT NULL,
+                watch_time_avg_seconds REAL NOT NULL,
+                followers_gained INTEGER NOT NULL,
+                is_simulated INTEGER NOT NULL DEFAULT 1
+                    CHECK (is_simulated IN (0, 1)),
+                FOREIGN KEY (script_id)
+                    REFERENCES approved_scripts(script_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scripts_topic
+                ON approved_scripts(topic);
+
+            CREATE INDEX IF NOT EXISTS idx_scripts_created
+                ON approved_scripts(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_script
+                ON performance_feedback(script_id);
 
             CREATE INDEX IF NOT EXISTS idx_posts_topic
                 ON posts(topic);
