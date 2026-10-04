@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_model: str = "openrouter/free"
 
+    tavily_api_key: str = ""
+
     app_env: str = "development"
 
     model_config = SettingsConfigDict(

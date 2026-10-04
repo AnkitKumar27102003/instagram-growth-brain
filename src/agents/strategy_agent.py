@@ -1,9 +1,11 @@
 
 import json
+import re
 from functools import lru_cache
 
-from sentence_transformers import SentenceTransformer
 from langchain_openai import ChatOpenAI
+from pydantic import ValidationError
+from sentence_transformers import SentenceTransformer
 
 from src.config import settings
 from src.memory.performance_memory import (
@@ -36,10 +38,13 @@ Rules:
    broad Indian audience.
 8. Explain why the proposed topic is relevant.
 9. Include topics, formats and hooks to avoid.
-10. Return only a valid JSON object matching the
-    schema provided in the user message.
-11. Do not include Markdown code fences or text
+10. Return one JSON object containing only the
+    fields required by the supplied schema.
+11. Do not return the JSON schema itself.
+12. Do not include Markdown code fences or text
     outside the JSON object.
+13. Do not add extra fields such as title, type,
+    properties, definitions or schema metadata.
 """
 
 
@@ -74,7 +79,9 @@ def are_topics_semantically_similar(
     represents cosine similarity.
     """
     if not 0.0 <= threshold <= 1.0:
-        raise ValueError("Similarity threshold must be between 0 and 1.")
+        raise ValueError(
+            "Similarity threshold must be between 0 and 1."
+        )
 
     normalized_a = _normalize_topic(topic_a)
     normalized_b = _normalize_topic(topic_b)
@@ -153,11 +160,10 @@ def _extract_response_text(content) -> str:
     )
 
 
-def _parse_strategy_response(raw_text: str) -> StrategyOutput:
-    """Parse JSON and validate it using the Pydantic model."""
+def _clean_json_text(raw_text: str) -> str:
+    """Remove Markdown fences and surrounding whitespace."""
     raw_text = raw_text.strip()
 
-    # Remove Markdown fences if the model adds them.
     if raw_text.startswith("```"):
         lines = raw_text.splitlines()
 
@@ -172,16 +178,125 @@ def _parse_strategy_response(raw_text: str) -> StrategyOutput:
         if raw_text.lower().startswith("json"):
             raw_text = raw_text[4:].strip()
 
+    # If the model added explanatory text around the JSON,
+    # attempt to isolate the JSON object.
+    if not raw_text.startswith("{"):
+        match = re.search(
+            r"\{.*\}",
+            raw_text,
+            flags=re.DOTALL,
+        )
+
+        if match:
+            raw_text = match.group(0).strip()
+
+    return raw_text
+
+
+def _unwrap_strategy_payload(parsed_data: dict) -> dict:
+    """
+    Unwrap common response envelopes while keeping the
+    actual StrategyOutput validation strict.
+
+    Does not remove unexpected fields from the strategy.
+    """
+    if not isinstance(parsed_data, dict):
+        raise ValueError(
+            "The model response must be a JSON object."
+        )
+
+    possible_wrappers = (
+        "StrategyOutput",
+        "strategy",
+        "output",
+        "data",
+    )
+
+    for wrapper in possible_wrappers:
+        nested = parsed_data.get(wrapper)
+
+        if isinstance(nested, dict):
+            return nested
+
+    return parsed_data
+
+
+def _parse_strategy_response(raw_text: str) -> StrategyOutput:
+    """Parse JSON and validate it using the Pydantic model."""
+    cleaned_text = _clean_json_text(raw_text)
+
     try:
-        parsed_data = json.loads(raw_text)
+        parsed_data = json.loads(cleaned_text)
+
+        if not isinstance(parsed_data, dict):
+            raise ValueError(
+                "The model response must be a JSON object."
+            )
+
+        parsed_data = _unwrap_strategy_payload(parsed_data)
+
         return StrategyOutput.model_validate(parsed_data)
 
-    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+    except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
         raise ValueError(
             "The model did not return valid StrategyOutput JSON. "
-            "Try again or select another OpenRouter model. "
+            "The response must contain only the fields defined "
+            "by StrategyOutput. "
             f"Parsing details: {exc}"
         ) from exc
+
+
+def _build_human_prompt(
+    context: dict,
+    schema: str,
+    duplicate_topic: str | None = None,
+    previous_error: str | None = None,
+) -> str:
+    """Build the generation or correction prompt."""
+    if duplicate_topic is not None:
+        instruction = (
+            "Your previous response repeated a recently "
+            "covered topic.\n\n"
+            f"Rejected topic: {duplicate_topic}\n\n"
+            "Generate a genuinely different topic. Do not use "
+            "the same topic with different wording or cover "
+            "the same underlying subject again. Choose a "
+            "distinct subject while following the original "
+            "account context.\n\n"
+        )
+    else:
+        instruction = (
+            "Create a content strategy using this account "
+            "context.\n\n"
+        )
+
+    prompt = (
+        f"{instruction}"
+        "Account context:\n"
+        f"{json.dumps(context, ensure_ascii=False, indent=2)}"
+        "\n\n"
+        "Return ONLY one valid JSON object representing a "
+        "StrategyOutput instance.\n"
+        "Do not return the JSON schema itself.\n"
+        "Do not include Markdown fences, comments, explanations, "
+        "or extra fields outside the schema.\n\n"
+        "The JSON must follow this schema:\n"
+        f"{schema}\n\n"
+        "The JSON must contain the actual strategy values, "
+        "not schema metadata such as title, type, properties, "
+        "or definitions."
+    )
+
+    if previous_error is not None:
+        prompt += (
+            "\n\nYour previous response failed validation:\n"
+            f"{previous_error}\n\n"
+            "Correct the response. Return a valid StrategyOutput "
+            "JSON object with all required fields and no "
+            "unexpected fields. Do not return the schema itself."
+        )
+
+    return prompt
 
 
 def generate_strategy(
@@ -243,44 +358,19 @@ def generate_strategy(
     schema = json.dumps(
         StrategyOutput.model_json_schema(),
         ensure_ascii=False,
+        indent=2,
     )
 
     duplicate_topic = None
+    previous_error = None
 
     for attempt in range(MAX_STRATEGY_ATTEMPTS):
-        # Build the prompt for this attempt.
-        human_prompt = (
-            "Create a content strategy using this "
-            "account context:\n"
-            f"{json.dumps(context, ensure_ascii=False, indent=2)}"
-            "\n\n"
-            "Return ONLY one valid JSON object. "
-            "Do not include Markdown fences, comments, "
-            "or explanations outside the JSON.\n\n"
-            "The JSON must follow this schema:\n"
-            f"{schema}"
+        human_prompt = _build_human_prompt(
+            context=context,
+            schema=schema,
+            duplicate_topic=duplicate_topic,
+            previous_error=previous_error,
         )
-
-        # Add feedback if a previous attempt generated a duplicate.
-        if duplicate_topic is not None:
-            human_prompt = (
-                "Your previous response repeated a recently "
-                "covered topic.\n\n"
-                f"Rejected topic: {duplicate_topic}\n\n"
-                "Generate a genuinely different topic. "
-                "Do not use the same topic with different wording "
-                "or cover the same underlying subject again. "
-                "Choose a distinct subject while following "
-                "the original account context.\n\n"
-                "Account context:\n"
-                f"{json.dumps(context, ensure_ascii=False, indent=2)}"
-                "\n\n"
-                "Return ONLY one valid JSON object. "
-                "Do not include Markdown fences, comments, "
-                "or explanations outside the JSON.\n\n"
-                "The JSON must follow this schema:\n"
-                f"{schema}"
-            )
 
         # Ask the model to generate the strategy.
         result = model.invoke(
@@ -292,7 +382,21 @@ def generate_strategy(
 
         # Extract and validate the model response.
         raw_text = _extract_response_text(result.content)
-        strategy = _parse_strategy_response(raw_text)
+
+        try:
+            strategy = _parse_strategy_response(raw_text)
+
+        except (ValueError, TypeError) as exc:
+            previous_error = str(exc)
+
+            if attempt == MAX_STRATEGY_ATTEMPTS - 1:
+                raise ValueError(
+                    "Failed to generate a valid StrategyOutput "
+                    f"after {MAX_STRATEGY_ATTEMPTS} attempts. "
+                    f"Last parsing error: {previous_error}"
+                ) from exc
+
+            continue
 
         # Reject duplicate topics and retry if attempts remain.
         try:
@@ -303,6 +407,7 @@ def generate_strategy(
 
         except ValueError as exc:
             duplicate_topic = strategy.topic
+            previous_error = None
 
             if attempt == MAX_STRATEGY_ATTEMPTS - 1:
                 raise ValueError(

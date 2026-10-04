@@ -10,3 +10,4 @@ streamlit
 pandas
 pytest
 sentence-transformers
+tavily-python
