@@ -13,46 +13,58 @@ from src.memory.performance_memory import (
     get_recent_content,
 )
 from src.models.strategy import StrategyOutput
+from src.analytics.fatigue import detect_feedback_topic_fatigue
+from src.analytics.performance import detect_breakout_content
 
 
 SYSTEM_PROMPT = """
-You are the Strategy Agent for NAZAR, an Indian
-Hinglish explainer channel covering politics,
-economy, history, geopolitics and current affairs.
+You are the Strategy Agent for NAZAR, an Indian Hinglish explainer
+channel covering politics, economy, history, geopolitics and current affairs.
 
-Your job is to propose a content strategy using
-the account's recent content and performance data.
+Your job is to propose a content strategy using the account's recent
+content and performance data.
 
 Rules:
 1. Do not repeat recently covered topics.
 2. Rotate hook styles and formats where practical.
-3. Use performance patterns as descriptive signals,
-   not guarantees of future results.
+3. Use performance patterns as descriptive signals, not guarantees.
 4. Keep simulated and real performance separate.
    Never describe simulated data as real.
 5. Do not invent events, statistics or sources.
-6. For political topics, remain neutral, factual
-   and nonpartisan. Do not advocate for political
-   actors, parties or policy choices.
-7. Prefer clear, simple Hinglish suitable for a
-   broad Indian audience.
+6. For political topics, remain neutral, factual and nonpartisan.
+7. Prefer clear, simple Hinglish suitable for a broad Indian audience.
 8. Explain why the proposed topic is relevant.
 9. Include topics, formats and hooks to avoid.
-10. Return one JSON object containing only the
-    fields required by the supplied schema.
+10. Return one JSON object containing only the fields required
+    by the supplied schema.
 11. Do not return the JSON schema itself.
-12. Do not include Markdown code fences or text
-    outside the JSON object.
-13. Do not add extra fields such as title, type,
-    properties, definitions or schema metadata.
+12. Do not include Markdown code fences or text outside the JSON.
+13. Do not add extra fields or schema metadata.
+14. Consider topic fatigue signals when selecting a topic.
+    Treat them as warnings, not proof of audience fatigue.
+15. Keep real and simulated fatigue signals separate.
+    Never treat simulated feedback as actual audience behaviour.
+16. Avoid topics flagged by real feedback when practical,
+    but balance this with relevance and content quality.
+17. Consider breakout content patterns when selecting a topic,
+    hook style, format and content bucket.
+18. Treat breakout signals as descriptive indicators,
+    not guarantees of future performance.
+19. Keep real and simulated breakout signals separate.
+    Never present simulated performance as real.
+20. Reuse successful content patterns, not exact topics,
+    scripts or wording from previous posts.
+21. Prefer a breakout pattern only when it also fits the channel,
+    the content goal and the available evidence.
+22. If no breakout patterns are available, continue using the
+    other account context without inventing any.
 """
 
-
-# Similarity threshold for flagging potentially
-# duplicate topics. Tune with real topic examples.
+# Similarity threshold for potentially duplicate topics.
+# Tune with real topic examples.
 SEMANTIC_SIMILARITY_THRESHOLD = 0.82
 
-# Maximum attempts: 1 initial attempt + 2 retries.
+# One initial attempt plus two retries.
 MAX_STRATEGY_ATTEMPTS = 3
 
 
@@ -93,7 +105,6 @@ def are_topics_semantically_similar(
         return True
 
     model = _get_embedding_model()
-
     embeddings = model.encode(
         [topic_a, topic_b],
         normalize_embeddings=True,
@@ -101,7 +112,6 @@ def are_topics_semantically_similar(
     )
 
     similarity = float(embeddings[0] @ embeddings[1])
-
     return similarity >= threshold
 
 
@@ -113,7 +123,6 @@ def validate_topic_is_new(
     proposed_topic = strategy.topic
 
     for recent_topic in recent_topics:
-        # First, check exact duplicates after normalization.
         if _normalize_topic(proposed_topic) == _normalize_topic(
             recent_topic
         ):
@@ -122,7 +131,6 @@ def validate_topic_is_new(
                 f"covered topic: {proposed_topic}"
             )
 
-        # Then check for semantic similarity.
         if are_topics_semantically_similar(
             proposed_topic,
             recent_topic,
@@ -145,10 +153,8 @@ def _extract_response_text(content) -> str:
         for part in content:
             if isinstance(part, str):
                 text_parts.append(part)
-
             elif isinstance(part, dict):
                 text_value = part.get("text")
-
                 if isinstance(text_value, str):
                     text_parts.append(text_value)
 
@@ -178,15 +184,12 @@ def _clean_json_text(raw_text: str) -> str:
         if raw_text.lower().startswith("json"):
             raw_text = raw_text[4:].strip()
 
-    # If the model added explanatory text around the JSON,
-    # attempt to isolate the JSON object.
     if not raw_text.startswith("{"):
         match = re.search(
             r"\{.*\}",
             raw_text,
             flags=re.DOTALL,
         )
-
         if match:
             raw_text = match.group(0).strip()
 
@@ -195,8 +198,8 @@ def _clean_json_text(raw_text: str) -> str:
 
 def _unwrap_strategy_payload(parsed_data: dict) -> dict:
     """
-    Unwrap common response envelopes while keeping the
-    actual StrategyOutput validation strict.
+    Unwrap common response envelopes while keeping
+    StrategyOutput validation strict.
 
     Does not remove unexpected fields from the strategy.
     """
@@ -214,7 +217,6 @@ def _unwrap_strategy_payload(parsed_data: dict) -> dict:
 
     for wrapper in possible_wrappers:
         nested = parsed_data.get(wrapper)
-
         if isinstance(nested, dict):
             return nested
 
@@ -234,10 +236,14 @@ def _parse_strategy_response(raw_text: str) -> StrategyOutput:
             )
 
         parsed_data = _unwrap_strategy_payload(parsed_data)
-
         return StrategyOutput.model_validate(parsed_data)
 
-    except (json.JSONDecodeError, ValidationError, ValueError, TypeError) as exc:
+    except (
+        json.JSONDecodeError,
+        ValidationError,
+        ValueError,
+        TypeError,
+    ) as exc:
         raise ValueError(
             "The model did not return valid StrategyOutput JSON. "
             "The response must contain only the fields defined "
@@ -282,7 +288,7 @@ def _build_human_prompt(
         "or extra fields outside the schema.\n\n"
         "The JSON must follow this schema:\n"
         f"{schema}\n\n"
-        "The JSON must contain the actual strategy values, "
+        "The JSON must contain actual strategy values, "
         "not schema metadata such as title, type, properties, "
         "or definitions."
     )
@@ -304,6 +310,8 @@ def generate_strategy(
     content_goal: str = "Recommend the next useful post for NAZAR.",
 ) -> StrategyOutput:
     """Generate a memory-aware strategy using OpenRouter."""
+    if not account_id or not account_id.strip():
+        raise ValueError("Account ID must not be empty.")
 
     if not settings.openrouter_api_key.strip():
         raise ValueError(
@@ -317,23 +325,27 @@ def generate_strategy(
         limit=10,
     )
 
-    # Retrieve historical performance patterns.
+    # Retrieve historical performance and learning signals.
     performance = get_performance_patterns(account_id)
+    topic_fatigue = detect_feedback_topic_fatigue(
+        account_id=account_id,
+    )
+    breakout_signals = detect_breakout_content(
+        account_id=account_id,
+    )
 
-    # Build avoidance lists from recent content.
+    # Build avoidance and rotation lists.
     recent_topics = [
         item["topic"] for item in recent_content
     ]
-
     recent_formats = [
         item["format"] for item in recent_content
     ]
-
     recent_hooks = [
         item["hook_style"] for item in recent_content
     ]
 
-    # Prepare context for the language model.
+    # Keep real and simulated feedback separate in the context.
     context = {
         "account_id": account_id,
         "content_goal": content_goal,
@@ -343,6 +355,8 @@ def generate_strategy(
         "recent_hooks_to_rotate": recent_hooks,
         "performance_patterns": performance["patterns"],
         "performance_note": performance["note"],
+        "topic_fatigue_signals": topic_fatigue,
+        "breakout_signals": breakout_signals,
     }
 
     # Configure OpenRouter using the OpenAI-compatible endpoint.
@@ -354,7 +368,6 @@ def generate_strategy(
         max_retries=1,
     )
 
-    # Give the model the expected Pydantic JSON schema.
     schema = json.dumps(
         StrategyOutput.model_json_schema(),
         ensure_ascii=False,
@@ -372,7 +385,6 @@ def generate_strategy(
             previous_error=previous_error,
         )
 
-        # Ask the model to generate the strategy.
         result = model.invoke(
             [
                 ("system", SYSTEM_PROMPT),
@@ -380,12 +392,10 @@ def generate_strategy(
             ]
         )
 
-        # Extract and validate the model response.
         raw_text = _extract_response_text(result.content)
 
         try:
             strategy = _parse_strategy_response(raw_text)
-
         except (ValueError, TypeError) as exc:
             previous_error = str(exc)
 
@@ -398,13 +408,11 @@ def generate_strategy(
 
             continue
 
-        # Reject duplicate topics and retry if attempts remain.
         try:
             validate_topic_is_new(
                 strategy,
                 recent_topics,
             )
-
         except ValueError as exc:
             duplicate_topic = strategy.topic
             previous_error = None
@@ -418,10 +426,8 @@ def generate_strategy(
 
             continue
 
-        # Topic is new, so return the validated strategy.
         return strategy
 
-    # Defensive fallback.
     raise RuntimeError(
         "Strategy generation ended unexpectedly."
     )

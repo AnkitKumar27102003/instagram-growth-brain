@@ -11,6 +11,11 @@ from src.models.script import ScriptOutput
 from src.models.verification import VerificationOutput
 
 
+MAX_CRITIC_ATTEMPTS = 2
+MAX_PREVIOUS_RESPONSE_CHARS = 4000
+MAX_ERROR_CHARS = 1500
+
+
 SYSTEM_PROMPT = """
 You are the Critic Agent for NAZAR, an Indian explainer
 and documentary-style social media channel.
@@ -21,26 +26,25 @@ on five criteria, each scored from 1 to 10:
 1. hook_strength: Does the opening create interest?
 2. emotional_arc: Does the script sustain interest and
    deliver a meaningful payoff?
-3. pacing: Is the flow concise and easy to follow?
-4. originality: Does the script offer a distinct angle?
-5. nazar_alignment: Is it clear, factual in tone,
-   neutral, non-partisan, and aligned with NAZAR?
+3. pacing: Is the script concise and easy to follow?
+4. originality: Does it offer a distinct angle?
+5. nazar_alignment: Is it factual in tone, neutral,
+   non-partisan, and aligned with NAZAR?
 
-You will be provided with research and verification
-results when available. Use these as the factual reference.
+Use supplied research and verification results as the
+factual reference when available.
 
 Verification rules:
-
-- "supported": The claim was supported by the verifier.
+- supported: The claim was supported by the verifier.
   Do not label it unverified without a specific reason.
-- "needs_verification": The claim has not been adequately
+- needs_verification: The claim has not been adequately
   verified. Do not treat it as an established fact.
-- "contradicted": The evidence conflicts with the claim.
+- conflicting: The evidence conflicts with the claim.
   Flag it as a factual problem.
 
-A claim marked "supported" can still be used inaccurately
-in the script. Check whether the script preserves the
-claim's meaning, date, scope, units, and context.
+A supported claim can still be used inaccurately in the
+script. Check whether the script preserves its meaning,
+date, scope, units, and context.
 
 Check whether statistics are clearly attributed and
 whether the script avoids presenting correlations as
@@ -52,7 +56,7 @@ unless the script actually uses it.
 Do not reward unsupported statistics or invented facts.
 Do not treat confident wording as evidence.
 
-Evaluate the script on:
+Evaluate:
 - Hook strength and curiosity
 - Emotional arc and meaningful payoff
 - Pacing and clarity
@@ -64,29 +68,43 @@ Evaluate the script on:
 Provide specific strengths, weaknesses, and actionable
 revision instructions. Avoid generic feedback.
 
-Revision instructions should be practical and specific.
+Revision instructions must be practical and specific.
 If the script is weak, explain how to improve it without
 inventing facts, statistics, examples, or human stories.
 
-Return only valid JSON matching the supplied schema.
-Do not include Markdown fences or text outside the JSON.
+Return only a valid JSON object matching the supplied
+schema. Do not include Markdown fences or extra text.
 """
 
 
 def _extract_json(response) -> dict:
-    """Extract a JSON object from the model response."""
-    content = response.content
+    """
+    Extract the first valid JSON object from a model response.
+
+    Handles plain JSON, Markdown fences, surrounding text,
+    and LangChain content blocks.
+    """
+    if isinstance(response, str):
+        content = response
+    else:
+        content = getattr(response, "content", None)
 
     if isinstance(content, list):
         text_parts = []
 
         for item in content:
-            if isinstance(item, dict):
-                text_parts.append(item.get("text", ""))
-            elif isinstance(item, str):
+            if isinstance(item, str):
                 text_parts.append(item)
+            elif isinstance(item, dict):
+                text_value = item.get("text")
+                if isinstance(text_value, str):
+                    text_parts.append(text_value)
+            else:
+                text_value = getattr(item, "text", None)
+                if isinstance(text_value, str):
+                    text_parts.append(text_value)
 
-        content = "".join(text_parts)
+        content = "\n".join(text_parts)
 
     if not isinstance(content, str):
         raise ValueError(
@@ -95,66 +113,53 @@ def _extract_json(response) -> dict:
 
     content = content.strip()
 
-    if content.startswith("```"):
-        content = content.removeprefix("```json")
-        content = content.removeprefix("```")
-        content = content.removesuffix("```").strip()
+    if not content:
+        raise ValueError("The model returned an empty response.")
 
-    data = json.loads(content)
+    decoder = json.JSONDecoder()
 
-    if not isinstance(data, dict):
-        raise ValueError(
-            "The model response must be a JSON object."
-        )
+    # Try each opening brace, allowing JSON to be surrounded
+    # by prose or Markdown fences.
+    for index, character in enumerate(content):
+        if character != "{":
+            continue
 
-    return data
+        try:
+            data, _ = decoder.raw_decode(content[index:])
+        except json.JSONDecodeError:
+            continue
 
+        if isinstance(data, dict):
+            return data
 
-def critique_script(
-    script: ScriptOutput,
-    research: ResearchOutput | None = None,
-    verification: VerificationOutput | None = None,
-) -> CritiqueOutput:
-    """
-    Critique a script using supplied research and verification
-    context where available.
-
-    research and verification are optional to preserve
-    compatibility with existing tests or callers that
-    only pass a script.
-    """
-    if not settings.openrouter_api_key:
-        raise ValueError(
-            "OPENROUTER_API_KEY is not configured."
-        )
-
-    model = ChatOpenAI(
-        model=settings.openrouter_model,
-        api_key=settings.openrouter_api_key,
-        base_url="https://openrouter.ai/api/v1",
-        temperature=0.2,
+    raise ValueError(
+        "No valid JSON object was found in the model response."
     )
 
+
+def _build_prompt(
+    script: ScriptOutput,
+    research: ResearchOutput | None,
+    verification: VerificationOutput | None,
+) -> str:
+    """Build the initial critic prompt with available context."""
     schema = json.dumps(
         CritiqueOutput.model_json_schema(),
         indent=2,
     )
 
     if research is not None:
-        research_context = research.model_dump_json(
-            indent=2
-        )
+        research_context = research.model_dump_json(indent=2)
     else:
         research_context = (
-            "No research context was supplied. "
-            "Be cautious with factual claims and "
-            "flag claims that cannot be verified "
-            "from the available information."
+            "No research context was supplied. Be cautious "
+            "with factual claims and flag claims that cannot "
+            "be verified from the available information."
         )
 
     if verification is not None:
-        verification_context = (
-            verification.model_dump_json(indent=2)
+        verification_context = verification.model_dump_json(
+            indent=2
         )
     else:
         verification_context = (
@@ -162,7 +167,7 @@ def critique_script(
             "Do not assume factual claims are verified."
         )
 
-    prompt = f"""
+    return f"""
 {SYSTEM_PROMPT}
 
 Required JSON schema:
@@ -180,40 +185,107 @@ Script to evaluate:
 Return your critique now.
 """
 
-    last_error = None
 
-    for attempt in range(2):
-        try:
-            response = model.invoke(prompt)
-            data = _extract_json(response)
+def _build_correction_prompt(
+    original_prompt: str,
+    error: Exception,
+    previous_response: str,
+) -> str:
+    """Build a focused correction prompt after invalid output."""
+    error_text = str(error)[:MAX_ERROR_CHARS]
+    response_text = previous_response[
+        :MAX_PREVIOUS_RESPONSE_CHARS
+    ]
 
-            return CritiqueOutput.model_validate(data)
+    return f"""
+{original_prompt}
 
-        except (
-            json.JSONDecodeError,
-            ValidationError,
-            ValueError,
-        ) as error:
-            last_error = error
+Your previous response was invalid.
 
-            if attempt == 0:
-                prompt = f"""
-{prompt}
+Validation error:
+{error_text}
 
-Your previous response failed validation:
-{str(error)}
+Previous response:
+{response_text}
 
-Return corrected JSON matching the schema exactly.
+Correct the response and return only one valid JSON object
+matching the required schema.
 
-All five scores must be between 1 and 10.
-All required fields must be present.
-Do not include Markdown fences or explanations.
-Return only valid JSON.
+Requirements:
+- Include all required fields.
+- Include all five scores.
+- Each score must be a number between 1 and 10.
+- strengths and weaknesses must each contain at least
+  one specific item.
+- revision_instructions must be practical and specific.
+- Do not add fields outside the schema.
+- Do not include Markdown fences or explanations.
 """
 
+
+def critique_script(
+    script: ScriptOutput,
+    research: ResearchOutput | None = None,
+    verification: VerificationOutput | None = None,
+) -> CritiqueOutput:
+    """
+    Critique a script using supplied research and verification
+    context where available.
+
+    Makes at most two model attempts: an initial attempt and
+    one corrective retry for invalid model output.
+
+    Provider/API errors are allowed to propagate rather than
+    being mistaken for response-validation errors.
+    """
+    if not settings.openrouter_api_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY is not configured."
+        )
+
+    model = ChatOpenAI(
+        model=settings.openrouter_model,
+        api_key=settings.openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+        temperature=0.2,
+    )
+
+    original_prompt = _build_prompt(
+        script=script,
+        research=research,
+        verification=verification,
+    )
+    prompt = original_prompt
+    last_error = None
+
+    for attempt in range(MAX_CRITIC_ATTEMPTS):
+        # Keep provider errors separate from parsing and schema
+        # errors. This avoids an unnecessary retry on API errors.
+        response = model.invoke(prompt)
+
+        try:
+            data = _extract_json(response)
+            return CritiqueOutput.model_validate(data)
+
+        except (ValueError, ValidationError) as error:
+            last_error = error
+
+            if attempt + 1 < MAX_CRITIC_ATTEMPTS:
+                previous_response = getattr(
+                    response, "content", ""
+                )
+                if not isinstance(previous_response, str):
+                    previous_response = str(previous_response)
+
+                prompt = _build_correction_prompt(
+                    original_prompt=original_prompt,
+                    error=error,
+                    previous_response=previous_response,
+                )
+
     raise ValueError(
-        "Critic Agent failed validation after 2 attempts: "
-        f"{last_error}"
+        f"Critic Agent failed validation after "
+        f"{MAX_CRITIC_ATTEMPTS} attempts: {last_error}"
     )
 
 

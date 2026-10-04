@@ -2,8 +2,12 @@
 import sqlite3
 
 import pytest
-
+import src.analytics.fatigue as fatigue
+import src.analytics.performance as performance
 import src.memory.performance_memory as memory
+
+from src.analytics.fatigue import detect_feedback_topic_fatigue
+from src.analytics.performance import detect_breakout_content
 
 
 @pytest.fixture
@@ -70,6 +74,9 @@ def test_db(tmp_path, monkeypatch):
         )
 
     monkeypatch.setattr(memory, "get_connection", test_connection)
+    monkeypatch.setattr(fatigue, "get_connection", test_connection)
+    monkeypatch.setattr(performance, "get_connection", test_connection)
+
     return test_connection
 
 
@@ -157,3 +164,228 @@ def test_invalid_reach_is_rejected(test_db):
             script_id=script_id,
             metrics=metrics,
         )
+
+
+def create_script(topic="Test topic"):
+    return memory.save_approved_script(
+        account_id="test_account",
+        topic=topic,
+        content_bucket="Economy",
+        hook_style="Curiosity",
+        format="Documentary Reel",
+        tone="Hinglish",
+        strategy={},
+        script_text="A sample test script.",
+        critic_score=9.0,
+    )
+
+
+def create_metrics(reach, likes, shares=0, saves=0, comments=0):
+    return {
+        "views": reach,
+        "reach": reach,
+        "likes": likes,
+        "shares": shares,
+        "saves": saves,
+        "comments": comments,
+        "watch_time_avg_seconds": 10,
+        "followers_gained": 0,
+    }
+
+
+def add_feedback(
+    script_id,
+    reach,
+    likes,
+    is_simulated=True,
+    shares=0,
+    saves=0,
+    comments=0,
+):
+    """Store one feedback record for a script."""
+    return memory.record_performance_feedback(
+        script_id=script_id,
+        metrics=create_metrics(
+            reach=reach,
+            likes=likes,
+            shares=shares,
+            saves=saves,
+            comments=comments,
+        ),
+        is_simulated=is_simulated,
+    )
+
+
+def test_feedback_fatigue_detects_engagement_decline(test_db):
+    script_id = create_script("Monsoon impact")
+
+    memory.record_performance_feedback(
+        script_id,
+        create_metrics(1000, 200),
+        is_simulated=True,
+    )
+    memory.record_performance_feedback(
+        script_id,
+        create_metrics(1000, 100),
+        is_simulated=True,
+    )
+
+    result = detect_feedback_topic_fatigue("test_account")
+
+    candidate = result["fatigue_candidates"][0]
+    assert candidate["topic"] == "Monsoon impact"
+    assert candidate["feedback_type"] == "simulated"
+    assert candidate["engagement_decline_percent"] == 50.0
+    assert candidate["fatigue_candidate"] is True
+
+
+def test_feedback_fatigue_keeps_real_and_simulated_separate(test_db):
+    script_id = create_script("Oil prices")
+
+    memory.record_performance_feedback(
+        script_id,
+        create_metrics(1000, 200),
+        is_simulated=True,
+    )
+    memory.record_performance_feedback(
+        script_id,
+        create_metrics(1000, 50),
+        is_simulated=False,
+    )
+
+    result = detect_feedback_topic_fatigue("test_account")
+
+    assert result["fatigue_candidates"] == []
+
+
+def test_feedback_fatigue_ignores_single_record(test_db):
+    script_id = create_script("Agriculture")
+
+    memory.record_performance_feedback(
+        script_id,
+        create_metrics(1000, 200),
+        is_simulated=True,
+    )
+
+    result = detect_feedback_topic_fatigue("test_account")
+
+    assert result["fatigue_candidates"] == []
+
+
+def test_breakout_detects_high_performing_script(test_db):
+    scripts = [
+        create_script("Oil prices"),
+        create_script("Inflation"),
+        create_script("Monsoon"),
+        create_script("Rupee depreciation"),
+    ]
+
+    for script_id in scripts[:3]:
+        add_feedback(script_id, reach=1000, likes=50)
+
+    add_feedback(
+        scripts[3],
+        reach=1000,
+        likes=400,
+        shares=50,
+        saves=50,
+    )
+
+    result = detect_breakout_content("test_account")
+
+    simulated = result["simulated"]
+    candidates = simulated["breakout_candidates"]
+
+    assert len(candidates) == 1
+    assert candidates[0]["topic"] == "Rupee depreciation"
+    assert candidates[0]["feedback_type"] == "simulated"
+    assert candidates[0]["breakout_candidate"] is True
+    assert candidates[0]["engagement_rate"] == 50.0
+    assert candidates[0]["performance_lift"] > 1.5
+    assert simulated["baseline_engagement_rate"] > 0
+
+
+def test_breakout_keeps_real_and_simulated_feedback_separate(test_db):
+    scripts = [
+        create_script("Oil prices"),
+        create_script("Inflation"),
+        create_script("Monsoon"),
+        create_script("Rupee depreciation"),
+    ]
+
+    for script_id in scripts:
+        add_feedback(
+            script_id,
+            reach=1000,
+            likes=50,
+            is_simulated=False,
+        )
+
+    for script_id in scripts[:3]:
+        add_feedback(
+            script_id,
+            reach=1000,
+            likes=50,
+            is_simulated=True,
+        )
+
+    add_feedback(
+        scripts[3],
+        reach=1000,
+        likes=400,
+        shares=50,
+        saves=50,
+        is_simulated=True,
+    )
+
+    result = detect_breakout_content("test_account")
+
+    assert result["real"]["breakout_candidates"] == []
+    assert len(result["simulated"]["breakout_candidates"]) == 1
+
+    assert result["real"]["feedback_records_checked"] == 4
+    assert result["simulated"]["feedback_records_checked"] == 4
+
+
+def test_breakout_requires_enough_distinct_scripts(test_db):
+    scripts = [
+        create_script("Oil prices"),
+        create_script("Inflation"),
+    ]
+
+    for script_id in scripts:
+        add_feedback(script_id, reach=1000, likes=100)
+
+    result = detect_breakout_content(
+        "test_account",
+        min_feedback_records=3,
+    )
+
+    assert result["simulated"]["breakout_candidates"] == []
+    assert result["simulated"]["baseline_engagement_rate"] == 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, error_message",
+    [
+        (
+            {"account_id": ""},
+            "account_id must not be empty",
+        ),
+        (
+            {"account_id": "test_account", "min_feedback_records": 1},
+            "min_feedback_records must be at least 2",
+        ),
+        (
+            {"account_id": "test_account", "breakout_multiplier": 1.0},
+            "breakout_multiplier must be greater than 1",
+        ),
+    ],
+)
+def test_breakout_rejects_invalid_parameters(
+    test_db,
+    kwargs,
+    error_message,
+):
+    with pytest.raises(ValueError, match=error_message):
+        detect_breakout_content(**kwargs)

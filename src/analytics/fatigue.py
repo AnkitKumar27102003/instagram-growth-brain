@@ -74,3 +74,106 @@ def detect_topic_fatigue(recent_limit: int = 5) -> dict:
             "are needed for a reliable conclusion."
         ),
     }
+
+
+def detect_feedback_topic_fatigue(
+    account_id: str,
+    recent_limit: int = 20,
+    decline_threshold: float = 30.0,
+) -> dict:
+    """Detect possible topic fatigue from approved-script feedback.
+
+    Simulated and real feedback are analysed separately.
+    A decline is a screening signal, not proof of audience fatigue.
+    """
+    if not account_id or not account_id.strip():
+        raise ValueError("account_id must not be empty.")
+    if recent_limit < 1:
+        raise ValueError("recent_limit must be positive.")
+    if not 0 <= decline_threshold <= 100:
+        raise ValueError("decline_threshold must be between 0 and 100.")
+
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT
+                s.topic,
+                f.recorded_at,
+                f.reach,
+                f.likes,
+                f.shares,
+                f.saves,
+                f.comments,
+                f.is_simulated
+            FROM approved_scripts AS s
+            JOIN performance_feedback AS f
+                ON s.script_id = f.script_id
+            WHERE s.account_id = ?
+              AND s.approved = 1
+              AND f.reach > 0
+            ORDER BY f.recorded_at DESC, f.feedback_id DESC
+            LIMIT ?
+            """,
+            (account_id, recent_limit),
+        ).fetchall()
+
+    groups = {}
+
+    for row in rows:
+        feedback_type = (
+            "simulated" if row["is_simulated"] else "real"
+        )
+        topic_key = (row["topic"], feedback_type)
+
+        interactions = (
+            row["likes"]
+            + row["shares"]
+            + row["saves"]
+            + row["comments"]
+        )
+        engagement_rate = interactions / row["reach"] * 100
+
+        groups.setdefault(topic_key, []).append({
+            "recorded_at": row["recorded_at"],
+            "engagement_rate": round(engagement_rate, 2),
+        })
+
+    candidates = []
+
+    for (topic, feedback_type), records in groups.items():
+        if len(records) < 2:
+            continue
+
+        latest = records[0]["engagement_rate"]
+        previous = records[1]["engagement_rate"]
+
+        decline = (
+            round((previous - latest) / previous * 100, 2)
+            if previous > 0
+            else 0.0
+        )
+
+        candidates.append({
+            "topic": topic,
+            "feedback_type": feedback_type,
+            "feedback_count": len(records),
+            "latest_engagement_rate": latest,
+            "previous_engagement_rate": previous,
+            "engagement_decline_percent": decline,
+            "repeated_recently": True,
+            "possible_performance_decline": (
+                decline >= decline_threshold
+            ),
+            "fatigue_candidate": decline >= decline_threshold,
+        })
+
+    return {
+        "account_id": account_id,
+        "feedback_records_checked": len(rows),
+        "fatigue_candidates": candidates,
+        "note": (
+            "Real and simulated feedback are analysed separately. "
+            "A decline is a screening signal, not causal proof "
+            "of audience fatigue."
+        ),
+    }

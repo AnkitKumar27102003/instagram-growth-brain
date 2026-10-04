@@ -151,3 +151,109 @@ def test_research_requires_tavily_key(monkeypatch):
     with pytest.raises(ValueError, match="TAVILY_API_KEY"):
         research_agent.research_topic(make_strategy())
 
+
+def test_extract_json_handles_surrounding_text():
+    response = SimpleNamespace(
+        content='Here is the result:\n{"topic": "Oil"}\nDone.'
+    )
+
+    assert research_agent._extract_json(response) == {
+        "topic": "Oil"
+    }
+
+
+def test_extract_json_handles_markdown_fence():
+    response = SimpleNamespace(
+        content='```json\n{"topic": "Oil"}\n```'
+    )
+
+    assert research_agent._extract_json(response) == {
+        "topic": "Oil"
+    }
+
+
+def test_extract_json_rejects_invalid_json():
+    response = SimpleNamespace(
+        content='{"topic": "Oil",}'
+    )
+
+    with pytest.raises(ValueError, match="valid JSON object"):
+        research_agent._extract_json(response)
+
+
+def test_extract_json_rejects_non_object():
+    response = SimpleNamespace(
+        content='["oil", "economy"]'
+    )
+
+    with pytest.raises(ValueError):
+        research_agent._extract_json(response)
+
+
+def test_research_rejects_topic_mismatch(monkeypatch):
+    data = make_research_response()
+    data["topic"] = "A different topic"
+
+    setup_mocks(monkeypatch, llm_response=data)
+
+    with pytest.raises(
+        ValueError,
+        match="failed validation",
+    ):
+        research_agent.research_topic(make_strategy())
+
+
+def test_research_retries_after_invalid_response(monkeypatch):
+    setup_mocks(monkeypatch)
+
+    valid_response = make_research_response()
+    responses = [
+        SimpleNamespace(content="not JSON"),
+        SimpleNamespace(content=json.dumps(valid_response)),
+    ]
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, prompt):
+            response = responses[self.calls]
+            self.calls += 1
+            return response
+
+    fake_model = FakeModel()
+
+    monkeypatch.setattr(
+        research_agent,
+        "ChatOpenAI",
+        lambda **kwargs: fake_model,
+    )
+
+    result = research_agent.research_topic(make_strategy())
+
+    assert result.topic == "Why oil prices affect India"
+    assert fake_model.calls == 2
+
+
+def test_research_provider_error_is_not_retried(monkeypatch):
+    setup_mocks(monkeypatch)
+
+    class FakeModel:
+        calls = 0
+
+        def invoke(self, prompt):
+            self.calls += 1
+            raise RuntimeError("Provider unavailable")
+
+    fake_model = FakeModel()
+
+    monkeypatch.setattr(
+        research_agent,
+        "ChatOpenAI",
+        lambda **kwargs: fake_model,
+    )
+
+    with pytest.raises(RuntimeError, match="Provider unavailable"):
+        research_agent.research_topic(make_strategy())
+
+    assert fake_model.calls == 1

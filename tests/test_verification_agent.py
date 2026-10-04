@@ -21,8 +21,14 @@ def sample_research():
         key_facts=[
             ResearchFact(
                 claim="GST is a consumption-based tax in India.",
-                evidence="The supplied research describes GST as a consumption tax.",
-                source_urls=["https://example.com/research"],
+                evidence=(
+                    "The supplied research describes GST "
+                    "as a consumption tax."
+                ),
+                source_urls=[
+                    "https://example.com/research"
+                ],
+                verification_status="supported",
             )
         ],
         sources=[
@@ -33,6 +39,7 @@ def sample_research():
             )
         ],
     )
+
 
 
 def sample_output(url="https://example.com/verification"):
